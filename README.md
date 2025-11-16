@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Question Answering(QA) Service
 
 This project implements a small HTTP service that answers natural-language questions about members, using the `/messages` endpoint from the public Aurora API. The goal of this version is to provide a simple, clear, and deterministic baseline capable of retrieving relevant information from messages and returning short factual answers when possible.
@@ -75,4 +74,3 @@ http://127.0.0.1:8000/ask
 =======
 # aurora-message-qa-service
 A deterministic FastAPI question-answering service built on public API
->>>>>>> 379a90ed547e6d6303c311b933378f5484d97bed
