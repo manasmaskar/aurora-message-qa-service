@@ -1,163 +1,285 @@
-# Design Notes – Question Answer (QA) Service (Version 1)
+# Design Notes – Question Answer (QA) Service (v1.1.0)
 
-This document explains the architectural choices behind Version 1 of the Question Answering Service, the reasoning behind key design decisions, and the known limitations of the current implementation. The goal of this version is simplicity, correctness, and predictable behavior using only the `/messages` endpoint from the public API.
-
----
-
-## 1. Architectural Overview
-
-The system is organized into three focused modules:
-
-### **1.1 Configuration Rationale (config.py)**
-- Inspection of the `/messages` endpoint showed a total of **3349 messages**, which is small enough to store fully in memory.
-- Caching the entire dataset reduces repeated API calls and enables all QA logic to operate on a consistent in-memory snapshot.
-- `MAX_MESSAGES_TO_CACHE = 5000` is selected as an optimal upper bound, allowing room for dataset expansion while ensuring that a sufficiently large set of messages is retained to capture user context without omitting important information..
-- `MAX_MESSAGES_TO_SCAN = 2000` ensures predictable per-request performance by limiting how many messages are scored for each question.
-- `PAGE_SIZE = 100` enables efficient pagination when loading the message dataset.
-- `CACHE_TTL_SECONDS = 300` refreshes the cache periodically without placing excessive load on the upstream API.
-- `REQUEST_TIMEOUT_SECONDS = 2.0` prevents slow or stalled upstream responses from blocking the service.
-- These values collectively balance performance, safety, and simplicity for the current data scale.
-
-### **1.1 MessageStore (message_store.py)**
-- Responsible for fetching data from the upstream `/messages` API.
-- Handles pagination and respects safety caps to avoid excessive load.
-- Maintains a TTL-based in-memory cache to ensure fresh but stable data.
-- Groups messages by lowercased sender name for easier lookups.
-- Provides a clean snapshot to the QA layer, abstracting away network I/O.
-
-This ensures that the QA logic works with a consistent view of all messages, without repeatedly querying the API.
+This document provides a complete technical overview of the Question Answering (QA) service, including architecture, component design, reasoning behind implementation choices, and newly added **API integrity analysis findings** based on deep diagnostics conducted against the Aurora `/messages` API.
 
 ---
 
-### **1.2 QA Logic (qa_logic.py)**
-The QA layer is intentionally lightweight and deterministic. It performs:
+# 1. Architectural Overview
 
-#### **Intent Detection**
-Classifies questions into:
-- **Time questions** – “when”, “what time”
-- **Count questions** – “how many”
-- **Preference questions** – “favorite”, “favourite”, “prefer”, “preference”
-- **Generic questions** – fallback when no specific intent is detected
+The system architecture is intentionally simple, modular, and deterministic:
 
-These categories directly match the examples provided in the assignment.
+```
+app/
+├── config.py
+├── main.py
+├── message_store.py
+├── models.py
+└── qa_logic.py
 
-#### **Keyword Extraction**
-- Removes common stopwords.
-- Extracts meaningful words from the question.
-- Used for filtering and scoring messages.
+analysis_bonus/
+├── analysis_api_deeper.py
+├── analysis_api_integrity.py
+├── analysis_bonus_activity.py
+├── analysis_duplicates.py
+├── analysis_user_fields.py
+└── analysis_bonus.py
 
-#### **Candidate Message Selection**
-- Finds messages containing at least one keyword.
-- Reduces the search space before scoring.
+tests/
+├── test.py
+└── test_name_logic.py
+```
 
-#### **Message Scoring**
-Messages are scored using:
-- **Keyword overlap**  
-- **Recency** (newer messages have slightly higher weight)
+### Core Components
 
-The top-scoring message becomes the basis of the answer.
+1. **MessageStore**  
+   Handles pagination, retries, deduplication, caching, and preprocessing of messages.
 
-#### **Answer Construction**
-Depending on intent, answers are formatted to be short, direct, and based on the best matching message.
+2. **QA Logic**  
+   Performs intent detection, name normalization, keyword filtering, scoring, and answer construction.
 
----
-
-### **1.3 FastAPI Application (main.py)**
-- Exposes the `/ask` endpoint.
-- On startup, preloads the message cache.
-- For each question:
-  - Ensures fresh message data.
-  - Delegates to the QA logic.
-  - Returns a structured `{"answer": "..."}` JSON response.
-
-This layer is intentionally minimal to keep the control flow easy to follow.
-
-### Health and Status Endpoints
-
-- The service provides lightweight `/health` and `/status` endpoints for operational visibility.
-- These endpoints allow external systems or deployment environments to verify that the application is running.
-- Both endpoints offer simple, non-sensitive responses that confirm service availability and basic readiness.
-- This supports integration with health probes, container orchestrators, or monitoring tools without exposing internal logic.
+3. **FastAPI Layer**  
+   Simple routing and orchestration between request inputs and QA logic.
 
 ---
 
-## 2. Data Scope and Intentional Exclusions
+# 2. Component-Level Design
 
-The Aurora API contains additional endpoints:
+## 2.1 Configuration (`config.py`)
 
-- `/movies`
-- `/image`
+- `PAGE_SIZE = 100`  
+- Request timeout = 2.0s  
+- Cache TTL = 300s  
+- Retry for unstable pages  
+- Total messages in API: **reported 3349**, but only **~3249 retrievable**
 
-After inspecting these endpoints:
-
-### **Movies**
-- Only global movie metadata is available.
-- No linkage to any member.
-- Cannot answer questions like:  
-  *“What movies has Layla watched?”*
-
-### **Images**
-- `/image` returns a random image without metadata.
-- No member-specific images, profile photos, or anything related.
-
-### Therefore, Version 1 intentionally supports only message-based questions.
-
-Unsupported questions return clear fallback responses rather than misleading answers. This is a deliberate decision to maintain correctness and avoid inventing associations that do not exist in the API.
+These values were tuned after running integrity scripts showing inconsistent API behavior.
 
 ---
 
-## 3. Limitations (Known & Expected for Version 1)
+## 2.2 MessageStore (`message_store.py`)
 
-### **3.1 Member identity is inferred from names**
-Since the upstream API exposes only a free-text `sender` field, cannot disambiguate:
-- Users with the same name  
-- Variations or typos of the same name  
+### Responsibilities:
+- Safe pagination retrieval
+- Deduplication using message UUID
+- Automatic retries on:
+  - 404
+  - 401
+  - 405
+  - Timeouts
+- Caching on in-memory store
+- Pre-normalization: grouping by lowercase sender names
 
-### **3.2 Message scanning is capped**
-For performance reasons:
-- Only a limited number of cached messages are scanned.
-- Very large datasets could hide relevant messages outside this cap.
+### Why?
+The Aurora API frequently returns:
+- Missing partitions  
+- Intermittent timeout errors  
+- Inconsistent boundaries  
+- Inaccurate total count  
 
-### **3.3 Heuristic intent detection**
-The system handles assignment-related questions well, but:
-- Synonyms or unusual phrasing may not match expected patterns.
-- Some queries fall back to generic answers.
-
-### **3.4 Unstructured and potentially ambiguous data**
-Messages may contain:
-- Contradictions  
-- Relative dates (e.g., “next Monday”)  
-- Partial information  
-
-This version uses a simple “best match” strategy rather than deep reasoning.
-
-### **3.5 Unsupported domains**
-Member-specific movie or image questions cannot be answered with the provided API and are intentionally marked as unsupported.
+Thus, MessageStore isolates all instability so the QA layer never breaks.
 
 ---
 
-## 4. Future Work (Further improvements)
+## 2.3 Deterministic QA Logic (`qa_logic.py`)
 
+### Intent detection (v1.1.0 expanded)
+A rule-based engine (no NLP libraries) supporting:
 
-### **4.1 Enhanced Intent Detection**
-- Expand synonyms and phrasing patterns.
-- Detect more question categories (e.g., “where”, “why”, “what is X about”).
+- COUNT  
+- WHEN  
+- WHERE  
+- FAVORITE  
+- BOOLEAN (yes/no)  
+- LIST  
+- WHAT_DOING  
+- WHAT DID X SAY ABOUT Y  
+- HISTORY / EVER / DURATION  
+- OPINION  
+- GENERIC fallback  
 
-### **4.2 Conflict Resolution Strategies**
-- When contradictory messages exist, prefer:
-  - Newest messages  
-  - Or explicitly mention uncertainty  
+### Name normalization
+- Lowercase match  
+- Partial-first-name  
+- Partial-last-name  
+- Full-name priority  
+- Avoid collisions (e.g., “Layla” vs “Layla K.”)
 
-### **4.5 Extended API Usage for Non-Member Queries**
-- General movie metadata (e.g., “What is the rating of Inception?”).
+### Keyword filtering
+Stopword removal -- keyword extraction -- candidate message filtering.
 
-### **4.6 Proper Logging and Metrics**
-Replace simple print statements with structured logs and error metrics.
+### Scoring framework
+- Keyword overlap  
+- Recency boost  
+- Person match boost  
+- Intent-specific weighting  
+- Penalty for loose matches  
+
+### Intent-specific answer formatting
+Each intent has its own curated extraction/formatting pipeline.
 
 ---
 
-## 5. Summary
+# 3. Detailed API Integrity & Data Reliability Findings
 
-Version 1 is intentionally scoped around the `/messages` API and provides a clean, maintainable baseline that answers the primary question types from the assignment. The system is designed to be easy to understand, deterministic, and conservative, returning factual information when available and clear fallbacks when not.
+The following findings come from running six deep-diagnostic tools under `analysis_bonus/`.
 
-These design choices ensure correctness and transparency while leaving a clear path for future enhancements.
+---
+
+## 3.1 Pagination Reliability (analysis_api_deeper)
+
+### **Reported total:**  
+`3349`
+
+### **Actual retrievable unique messages:**  
+`3249`  
+→ ~100 messages are **unreachable** on every run.
+
+### **Observed behaviors:**
+- Some skip positions **always fail**
+- Certain pages intermittently return:
+  - 404
+  - 405
+  - 401  
+- Rare 5-second timeouts
+- Boundary cases behave logically:
+  - skip < 0 -- empty list
+  - skip > max -- empty list
+
+### **Interpretation:**  
+The Aurora API uses **unstable backend pagination**, likely partitioned storage or sharded data with partial availability.
+
+---
+
+## 3.2 Throttling & Rate Behavior
+Repeated hits on the same page:
+
+```
+0.157s  
+0.162s  
+0.163s  
+0.167s  
+0.245s
+```
+
+Sequential pages show similar fluctuations.
+
+No 429 throttling was observed, but **intermittent 404/405** indicates backend instability.
+
+---
+
+## 3.3 Duplicate Detection (analysis_duplicates.py)
+
+- Messages analyzed: **2949**
+- Duplicate IDs: **0**
+- Duplicate texts: **0**
+- Short-window duplicates: **0**
+
+**Conclusion:**  
+The message dataset despite missing pages does **not contain duplicates**.
+
+---
+
+## 3.4 User Field Quality (analysis_user_fields.py)
+
+Across 100 sampled messages:
+
+- No missing `user_name`
+- No missing `user_id`
+- No user_id mapped to multiple names
+- No corrupted or symbol-only names
+
+**Conclusion:**  
+User identity fields are consistent and clean.
+
+---
+
+## 3.5 Activity Analysis (analysis_bonus_activity.py)
+
+### **Top active users:**
+- Vikram Desai — 70 msgs
+- Sophia Al-Farsi — 66
+- Armand Dupont — 62
+- Lily O’Sullivan — 60
+- Fatima El-Tahir — 59
+- Layla Kawaguchi — 59
+
+### **Global message span:**  
+~335–357 days
+
+### **Max inactivity gaps:**  
+20–39 days per user
+
+### **Anomalies:**  
+- Vikram Desai shows unusually high volume (>= 69.4 vs avg ~60)
+- No single-message users  
+- No major inactivity gaps
+
+**Conclusion:**  
+Chat behavior resembles a long-running, stable group conversation.
+
+---
+
+## 3.6 Naming Pattern Consistency (analysis_bonus.py)
+
+Across 200 sampled messages:
+
+- Distinct normalized names: 10  
+- No raw spelling variants  
+- No abbreviation conflicts  
+- No first-name collisions  
+- No inconsistent naming patterns
+
+**Conclusion:**  
+Name normalization is simplifying a stable dataset—not correcting corrupted names.
+
+---
+
+# 4. Why `/movies` and `/image` Endpoints Were Excluded
+
+- They do not map to specific users  
+- No linkage to `/messages`  
+- Including them would require fabricating associations  
+- Assessment requirements clearly focus on conversational QA via `/messages` only
+
+Thus, excluding them maintains determinism and integrity.
+
+---
+
+# 5. Limitations
+
+- Ambiguous names cannot always be resolved  
+- Some relevant messages may lie within unretrievable API partitions  
+- Intent classification is rule-based, not semantic  
+- No embeddings or LLM reasoning (intentionally constrained)  
+
+---
+
+# 6. Future Work
+
+- Multi-message summarization  
+- Confidence scoring  
+- More comprehensive testing  
+- Optional vector search layer  
+- Improved ambiguity handling  
+- Enhanced observability (trace logs, metrics)
+
+---
+
+# 7. Summary
+
+Version **1.1.0** significantly improves reliability and accuracy by adding:
+
+- Expanded deterministic intent engine  
+- Advanced name normalization  
+- Intent-aware ranking & formatting  
+- Defenses against unstable API behaviors  
+- Detailed API integrity analysis  
+- Stronger caching & retry logic  
+
+Despite upstream issues, the system remains:
+
+ - Deterministic  
+ - Explainable  
+ - Stable  
+ - Aligned with assessment requirements  
+
