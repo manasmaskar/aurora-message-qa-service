@@ -3,6 +3,10 @@
 A deterministic question-answering service built on top of the Public Messages API.  
 This version unifies the simple baseline from **v1.0.0** with the advanced intent, ranking, and reliability improvements of **v1.1.0** into one polished and production-ready.
 
+Hosted on Render use this link to view the API --> 
+```bash
+https://aurora-message-qa-service.onrender.com/docs
+```
 ---
 
 # Overview
