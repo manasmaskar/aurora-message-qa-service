@@ -6,9 +6,9 @@ Load the fresh messages and pass on to question answering layer (QA) and return 
 
 from fastapi import FastAPI, HTTPException, Query
 
-from models import AskResponse
-from message_store import store
-from qa_logic import answer_question
+from .models import AskResponse
+from .message_store import store
+from .qa_logic import answer_question
 
 
 app = FastAPI(title="Aurora Member Messages QA API")

@@ -9,14 +9,15 @@ import time
 import requests
 from fastapi import HTTPException
 
-from config import (
+from .config import (
     MESSAGES_ENDPOINT,
     CACHE_TTL_SECONDS,
     MAX_MESSAGES_TO_CACHE,
     PAGE_SIZE,
     REQUEST_TIMEOUT_SECONDS,
+    MAX_MESSAGES_TO_SCAN,
 )
-from models import Message, PaginatedMessages
+from .models import Message, PaginatedMessages
 
 
 class MessageStore:
